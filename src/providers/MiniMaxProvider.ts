@@ -123,7 +123,19 @@ export class MiniMaxProvider implements vscode.LanguageModelChatProvider {
 
     let reasoningBuffer = "";
     const thinkingPartCtor = this.getThinkingPartCtor();
-    const useReasoningSplit = Boolean(thinkingPartCtor);
+    const useReasoningSplit = true;
+    const contentFilter = this.createThinkTagFilter(
+      thinkingPartCtor
+        ? (thinkChunk) => {
+            const thinkingPart = new thinkingPartCtor(thinkChunk, undefined, {
+              cache_control: { type: 'ephemeral' },
+            });
+            (progress as vscode.Progress<vscode.LanguageModelResponsePart | unknown>).report(
+              thinkingPart as vscode.LanguageModelResponsePart,
+            );
+          }
+        : undefined,
+    );
     const pendingToolCalls = new Map<number, AccumulatedToolCall>();
     let toolCallsEmitted = false;
     const tools = this.convertTools(options.tools);
@@ -164,7 +176,10 @@ export class MiniMaxProvider implements vscode.LanguageModelChatProvider {
 
         const content = choice.delta?.content;
         if (content) {
-          progress.report(new vscode.LanguageModelTextPart(content));
+          const filtered = contentFilter(content);
+          if (filtered) {
+            progress.report(new vscode.LanguageModelTextPart(filtered));
+          }
         }
 
         this.accumulateToolCalls(choice, pendingToolCalls);
@@ -337,6 +352,11 @@ export class MiniMaxProvider implements vscode.LanguageModelChatProvider {
       if (part instanceof vscode.LanguageModelTextPart) {
         text += part.value;
       } else if (part instanceof vscode.LanguageModelDataPart) {
+        // Skip VS Code-internal cache control hints (e.g. cache_control/ephemeral)
+        // that are meaningless to non-Anthropic models.
+        if (part.mimeType === "cache_control") {
+          continue;
+        }
         text += `[data:${part.mimeType};base64,${Buffer.from(part.data).toString("base64")}]`;
       } else if (
         part &&
@@ -520,10 +540,68 @@ export class MiniMaxProvider implements vscode.LanguageModelChatProvider {
       return;
     }
 
-    const thinkingPart = new thinkingPartCtor(text, reasoning.id, reasoning.metadata);
+    const thinkingPart = new thinkingPartCtor(text, reasoning.id, {
+      ...reasoning.metadata,
+      cache_control: { type: "ephemeral" },
+    });
     (progress as vscode.Progress<vscode.LanguageModelResponsePart | unknown>).report(
       thinkingPart as vscode.LanguageModelResponsePart,
     );
+  }
+
+  private createThinkTagFilter (onThinkChunk?: (text: string) => void): (chunk: string) => string {
+    const OPEN = '<think>';
+    const CLOSE = '</think>';
+    let buffer = '';
+    let insideThink = false;
+
+    const longestSuffixMatch = (pattern: string): number => {
+      for (let len = Math.min(buffer.length, pattern.length - 1); len >= 1; len--) {
+        if (buffer.endsWith(pattern.slice(0, len))) {
+          return len;
+        }
+      }
+      return 0;
+    };
+
+    return (chunk: string): string => {
+      buffer += chunk;
+      let output = '';
+
+      while (true) {
+        if (!insideThink) {
+          const idx = buffer.indexOf(OPEN);
+          if (idx === -1) {
+            const keep = longestSuffixMatch(OPEN);
+            output += buffer.slice(0, buffer.length - keep);
+            buffer = buffer.slice(buffer.length - keep);
+            break;
+          }
+          output += buffer.slice(0, idx);
+          buffer = buffer.slice(idx + OPEN.length);
+          insideThink = true;
+        } else {
+          const idx = buffer.indexOf(CLOSE);
+          if (idx === -1) {
+            const keep = longestSuffixMatch(CLOSE);
+            const thinkChunk = buffer.slice(0, buffer.length - keep);
+            if (thinkChunk && onThinkChunk) {
+              onThinkChunk(thinkChunk);
+            }
+            buffer = buffer.slice(buffer.length - keep);
+            break;
+          }
+          const thinkChunk = buffer.slice(0, idx);
+          if (thinkChunk && onThinkChunk) {
+            onThinkChunk(thinkChunk);
+          }
+          buffer = buffer.slice(idx + CLOSE.length);
+          insideThink = false;
+        }
+      }
+
+      return output;
+    };
   }
 
   private getThinkingPartCtor(): ThinkingPartCtor | undefined {
